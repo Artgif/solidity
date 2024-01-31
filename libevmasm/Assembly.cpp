@@ -484,9 +484,6 @@ Json::Value Assembly::assemblyJSON(std::map<std::string, unsigned> const& _sourc
 			maxSourceIndex = std::max(sourceIndex, maxSourceIndex);
 			jsonSourceList[sourceIndex] = sourceName;
 		}
-		for (unsigned i = 0; i < maxSourceIndex; ++i)
-			if (jsonSourceList[i] == Json::nullValue)
-				jsonSourceList[i] = "unknown-source-" + std::to_string(i);
 	}
 
 	if (!m_data.empty() || !m_subs.empty())
@@ -562,7 +559,7 @@ std::pair<std::shared_ptr<Assembly>, std::vector<std::string>> Assembly::fromJSO
 
 	result->importAssemblyItemsFromJSON(_json[".code"], _level == 0 ? parsedSourceList : _sourceList);
 
-	if (_json[".auxdata"])
+	if (_json.isMember(".auxdata"))
 	{
 		solRequire(_json[".auxdata"].isString(), AssemblyImportException, "Optional member '.auxdata' is not a string.");
 		result->m_auxiliaryData = fromHex(_json[".auxdata"].asString());
