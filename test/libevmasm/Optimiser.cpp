@@ -974,6 +974,41 @@ BOOST_AUTO_TEST_CASE(block_deduplicator_loops)
 	BOOST_CHECK_EQUAL(pushTags.size(), 1);
 }
 
+BOOST_AUTO_TEST_CASE(block_deduplicator_dup_push0)
+{
+	AssemblyItems input{
+		AssemblyItem(Tag, 1),
+		Instruction::POP,
+		u256(4),
+		Instruction::CALLDATASIZE,
+		Instruction::LT,
+		AssemblyItem(PushTag, 2),
+		Instruction::JUMPI,
+		u256(1),
+		u256(2),
+		Instruction::ADD,
+		Instruction::POP,
+		AssemblyItem(Tag, 3),
+		Instruction::JUMPI,
+		u256(0),
+		Instruction::DUP1,
+		Instruction::REVERT,
+		AssemblyItem(Tag, 2),
+		u256(0),
+		Instruction::DUP1,
+		Instruction::REVERT,
+		AssemblyItem(Tag, 3),
+		Instruction::STOP
+	};
+	AssemblyItems output = input;
+	BlockDeduplicator deduplicator(output);
+	deduplicator.deduplicate();
+	BOOST_CHECK_EQUAL_COLLECTIONS(
+		input.begin(), input.end(),
+		output.begin(), output.end()
+	);
+}
+
 BOOST_AUTO_TEST_CASE(clear_unreachable_code)
 {
 	AssemblyItems items{
@@ -1647,6 +1682,42 @@ BOOST_AUTO_TEST_CASE(cse_replace_too_large_shift)
 		u256(255),
 		Instruction::SHR
 	});
+}
+
+BOOST_AUTO_TEST_CASE(cse_dup)
+{
+	AssemblyItems input{
+		u256(0),
+		Instruction::DUP1,
+		Instruction::REVERT
+	};
+	AssemblyItems output = input;
+
+	checkCSE(input, output);
+	checkFullCSE(input, output);
+}
+
+BOOST_AUTO_TEST_CASE(cse_push0)
+{
+	AssemblyItems input{
+		u256(0),
+		u256(0),
+		Instruction::REVERT
+	};
+	AssemblyItems output{
+		u256(0),
+		Instruction::DUP1,
+		Instruction::REVERT
+	};
+
+	checkCSE(input, output);
+	
+	output = AssemblyItems{
+		u256(0),
+		u256(0),
+		Instruction::REVERT
+	};
+	checkFullCSE(input, output);
 }
 
 BOOST_AUTO_TEST_CASE(inliner)
