@@ -33,6 +33,7 @@
 #include <libsolidity/experimental/codegen/Common.h>
 
 #include <range/v3/view/drop_last.hpp>
+#include <range/v3/view/zip.hpp>
 
 using namespace solidity;
 using namespace solidity::util;
@@ -47,8 +48,69 @@ std::string IRGeneratorForStatements::generate(ASTNode const& _node)
 }
 
 
-namespace
+namespace solidity::frontend::experimental
 {
+
+static std::size_t stackSize(IRGenerationContext const& _context, Type _type)
+{
+	TypeSystemHelpers helper{_context.analysis.typeSystem()};
+	_type = _context.env->resolve(_type);
+	solAssert(std::holds_alternative<TypeConstant>(_type), "No monomorphized type.");
+
+	// type -> # stack slots
+	// unit, itself -> 0
+	// void, literals(integer), typeFunction -> error (maybe generate a revert)
+	// word, bool, function -> 1
+	// pair -> sum(stackSize(args))
+	// user-defined -> stackSize(underlying type)
+	TypeConstant typeConstant = std::get<TypeConstant>(_type);
+	if (
+		helper.isPrimitiveType(_type, PrimitiveType::Unit) ||
+		helper.isPrimitiveType(_type, PrimitiveType::Itself)
+	)
+		return 0;
+	else if (
+		helper.isPrimitiveType(_type, PrimitiveType::Bool) ||
+		helper.isPrimitiveType(_type, PrimitiveType::Word)
+	)
+	{
+		solAssert(typeConstant.arguments.empty(), "Primitive type Bool or Word should have no arguments.");
+		return 1;
+	}
+	else if (helper.isFunctionType(_type))
+		return 1;
+	else if (
+		helper.isPrimitiveType(_type, PrimitiveType::Integer) ||
+		helper.isPrimitiveType(_type, PrimitiveType::Void) ||
+		helper.isPrimitiveType(_type, PrimitiveType::TypeFunction)
+	)
+		solAssert(false, "Attempted to query the stack size of a type without stack representation.");
+	else if (helper.isPrimitiveType(_type, PrimitiveType::Pair))
+	{
+		solAssert(typeConstant.arguments.size() == 2);
+		return stackSize(_context, typeConstant.arguments.front()) + stackSize(_context, typeConstant.arguments.back());
+	}
+	else
+	{
+		Type underlyingType = _context.env->resolve(
+			_context.analysis.annotation<TypeInference>().underlyingTypes.at(typeConstant.constructor));
+		if (helper.isTypeConstant(underlyingType))
+			return stackSize(_context, underlyingType);
+
+		TypeEnvironment env = _context.env->clone();
+		Type genericFunctionType = helper.typeFunctionType(
+			helper.tupleType(typeConstant.arguments),
+			env.typeSystem().freshTypeVariable({}));
+		solAssert(env.unify(genericFunctionType, underlyingType).empty());
+
+		Type resolvedType = env.resolveRecursive(genericFunctionType);
+		auto [argumentType, resultType] = helper.destTypeFunctionType(resolvedType);
+		return stackSize(_context, resultType);
+	}
+
+	//TODO: sum types
+	return 0;
+}
 
 struct CopyTranslate: public yul::ASTCopier
 {
@@ -101,7 +163,7 @@ private:
 		auto type = m_context.analysis.annotation<TypeInference>(*varDecl).type;
 		solAssert(type);
 		solAssert(m_context.env->typeEquals(*type, m_context.analysis.typeSystem().type(PrimitiveType::Word, {})));
-		std::string value = IRVariable{*varDecl, *type, IRGeneratorForStatements::stackSize(m_context, *type)}.name();
+		std::string value = IRVariable{*varDecl, *type, stackSize(m_context, *type)}.name();
 		return yul::Identifier{_identifier.debugData, yul::YulString{value}};
 	}
 
@@ -109,8 +171,6 @@ private:
 	yul::Dialect const& m_dialect;
 	std::map<yul::Identifier const*, InlineAssemblyAnnotation::ExternalIdentifierInfo> m_references;
 };
-
-}
 
 bool IRGeneratorForStatements::visit(TupleExpression const& _tupleExpression)
 {
@@ -201,9 +261,9 @@ void IRGeneratorForStatements::endVisit(BinaryOperation const& _binaryOperation)
 	Type functionType = helper.functionType(helper.tupleType({leftType, rightType}), resultType);
 	auto [typeClass, memberName] = m_context.analysis.annotation<TypeInference>().operators.at(_binaryOperation.getOperator());
 	auto const& functionDefinition = resolveTypeClassFunction(typeClass, memberName, functionType);
-	std::string functionDeclaration = var(_binaryOperation).commaSeparatedList();
-	if (!functionDeclaration.empty())
-		m_code << "let " << functionDeclaration << " := ";
+	std::string result = var(_binaryOperation).commaSeparatedList();
+	if (!result.empty())
+		m_code << "let " << result << " := ";
 	m_code << buildFunctionCall(functionDefinition, functionType, _binaryOperation.arguments());
 }
 
@@ -230,15 +290,9 @@ std::string IRGeneratorForStatements::buildFunctionCall(FunctionDefinition const
 
 void IRGeneratorForStatements::assign(IRVariable const& _lhs, IRVariable const& _rhs, bool _declare)
 {
-	solAssert(IRGeneratorForStatements::stackSize(m_context, _lhs.type()) == IRGeneratorForStatements::stackSize(m_context, _rhs.type()));
-	// TODO: conversions for abs and rep for user-defined types as no-ops
-	if (IRGeneratorForStatements::stackSize(m_context, _lhs.type()) == 1)
-		m_code << (_declare ? "let " : "") <<  _lhs.name() << " := " << _rhs.name() << "\n";
-	else
-	{
-		for (size_t i = 0; i < _lhs.stackSize(); ++i)
-			m_code << (_declare ? "let " : "") << _lhs.stackSlots()[i] << " := " << _rhs.stackSlots()[i] << "\n";
-	}
+	solAssert(stackSize(m_context, _lhs.type()) == stackSize(m_context, _rhs.type()));
+	for (auto&& [lhsSlot, rhsSlot]: ranges::zip_view(_lhs.stackSlots(), _rhs.stackSlots()))
+		m_code << (_declare ? "let " : "") << lhsSlot << " := " <<  rhsSlot << "\n";
 }
 
 void IRGeneratorForStatements::declare(IRVariable const& _var)
@@ -358,9 +412,9 @@ void IRGeneratorForStatements::endVisit(FunctionCall const& _functionCall)
 	solAssert(functionDefinition);
 	// TODO: account for return stack size
 	solAssert(!functionDefinition->returnParameterList());
-	std::string functionDeclaration = var(_functionCall).commaSeparatedList();
-	if (!functionDeclaration.empty())
-		m_code << "let " << var(_functionCall).commaSeparatedList() << " := ";
+	std::string result = var(_functionCall).commaSeparatedList();
+	if (!result.empty())
+		m_code << "let " << result << " := ";
 	m_code << buildFunctionCall(*functionDefinition, functionType, _functionCall.arguments());
 }
 
@@ -417,4 +471,6 @@ bool IRGeneratorForStatements::visit(Assignment const& _assignment)
 bool IRGeneratorForStatements::visitNode(ASTNode const&)
 {
 	solAssert(false, "Unsupported AST node during statement code generation.");
+}
+
 }
